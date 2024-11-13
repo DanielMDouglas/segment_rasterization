@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+
+import h5py
+import numpy as np
+from scipy import stats as st
+import tqdm
+from collections import defaultdict
+
+def get_traj(track_segment, trajectories):
+    thisTraj = trajectories[trajectories['trackID'] == track_segment['trackID']]
+    return thisTraj
+
+def get_ancestor_traj(traj, trajectories):
+    # print (traj['parentID'])
+    if traj['parentID'] == -1:
+        return traj
+    else:
+        parent_traj = trajectories[trajectories['trackID'] == traj['parentID']]
+        return get_ancestor_traj(parent_traj, trajectories)
+
+def track_labeller(tracks, trajectories, method = 'pid'):
+    if method == 'primary':
+        anc_labels = {13: 0,
+                      22: 1}
+        labels = np.empty(tracks.shape[0])
+        for i, thisTrack in enumerate(tracks):
+            thisTraj = get_traj(thisTrack, trajectories)
+            anc = get_ancestor_traj(thisTraj, trajectories)
+            labels[i] = anc_labels[anc['pdgId'][0]]
+    elif method == 'pid':
+        labels = np.empty(tracks.shape[0])
+        for i, thisTrack in enumerate(tracks):
+            thisTraj = get_traj(thisTrack, trajectories)
+            if thisTraj['pdgId'][0] == 13:
+                labels[i] = 0
+            else:
+                labels[i] = 1
+            
+    return labels
+
+def voxelize(tracks, trajectories, config):
+    # a bit wider than the generation volume
+    # xMin, xMax, xWidth = 410.0, 920.0, 0.38
+    # yMin, yMax, yWidth = -225.0, 85.0, 0.38
+    # zMin, zMax, zWidth = -305.0, 405.0, 0.38
+
+    if config == 'ND-LAr':
+        # ND-LAr
+        xMin, xMax, xWidth = -380., 950., 0.38
+        yMin, yMax, yWidth = -380., 950., 0.38
+        zMin, zMax, zWidth = -380., 950., 0.38
+    elif config == 'fineVox':
+        # finer voxelization
+        xMin, xMax, xWidth = -2000., 2000., 0.1
+        yMin, yMax, yWidth = -2000., 2000., 0.1
+        zMin, zMax, zWidth = -2000., 2000., 0.1
+    elif config == 'ND-LAr_large':
+        # finer voxelization
+        xMin, xMax, xWidth = -2000., 2000., 0.38
+        yMin, yMax, yWidth = -2000., 2000., 0.38
+        zMin, zMax, zWidth = -2000., 2000., 0.38
+    elif config == '2x2':
+        # 2x2
+        xMin, xMax, xWidth = -65.5, 65.5, 0.4434
+        yMin, yMax, yWidth = -24., 108., 0.4434
+        zMin, zMax, zWidth = -66.5, 66.5, 0.4434
+    else:
+        raise LookupError ("config should be specified as one of: 'ND-LAr', 'fineVox', '2x2'")
+
+    # use strict bin width.  If given min, max intervals are not aligned,
+    # adjust the max bound to fit a full bin
+
+    nVoxXfloat = (xMax - xMin)/xWidth
+    nVoxYfloat = (yMax - yMin)/yWidth
+    nVoxZfloat = (zMax - zMin)/zWidth
+    
+    nVoxX = int(nVoxXfloat)
+    nVoxY = int(nVoxYfloat)
+    nVoxZ = int(nVoxZfloat)
+
+    if nVoxXfloat > nVoxX:
+        nVoxX += 1
+        xMax = xWidth*nVoxX + xMin
+    if nVoxYfloat > nVoxY:
+        nVoxY += 1
+        yMax = yWidth*nVoxY + yMin
+    if nVoxZfloat > nVoxZ:
+        nVoxZ += 1
+        zMax = zWidth*nVoxZ + zMin
+
+    minVox = np.array([xMin, yMin, zMin])
+    maxVox = np.array([xMax, yMax, zMax])
+
+    spacing = np.array([xWidth, yWidth, zWidth])
+
+    trackVoxelEdges = (np.linspace(xMin, xMax, nVoxX+1),
+                       np.linspace(yMin, yMax, nVoxY+1),
+                       np.linspace(zMin, zMax, nVoxZ+1))
+    
+    sampleDensity = 1000 # samples per unit (mm) length
+
+    labels = track_labeller(tracks, trajectories)
+    # for track in tqdm.tqdm(tracks):
+    for label, track in zip(labels, tracks):
+        start = np.array([track['x_start'],
+                          track['y_start'],
+                          track['z_start']])
+        end = np.array([track['x_end'],
+                        track['y_end'],
+                        track['z_end']])
+
+        nSamples = int(track['dx']*sampleDensity)
+
+        trackSampleSpace = np.expand_dims(np.linspace(0, 1, nSamples), -1)
+        # sample with a fixed spacing along the track trajectory
+        trackSamplePoints = start + trackSampleSpace*(end - start)
+        # give each sample the approprate amount of dE
+        trackSampleWeights = np.ones(trackSamplePoints.shape[0])*track['dE']/nSamples
+        trackSamplePIDs = np.ones(trackSamplePoints.shape[0])*track['pdgId']
+        trackSamplet0s = np.arange(trackSamplePoints.shape[0])*(track['t0_end'] - track['t0_start'])/trackSamplePoints.shape[0] + track['t0_start']
+        trackSampleLabels = np.ones(trackSamplePoints.shape[0])*label
+
+        if not 'samplePoints' in dir():
+            samplePoints = trackSamplePoints
+            sampleWeights = trackSampleWeights
+            samplePIDs = trackSamplePIDs
+            samplet0s = trackSamplet0s
+            sampleLabels = trackSampleLabels
+        else:
+            samplePoints = np.concatenate([samplePoints,
+                                           trackSamplePoints])
+            sampleWeights = np.concatenate([sampleWeights,
+                                            trackSampleWeights])
+            samplePIDs = np.concatenate([samplePIDs,
+                                         trackSamplePIDs])
+            samplet0s = np.concatenate([samplet0s,
+                                        trackSamplet0s])
+            sampleLabels = np.concatenate([sampleLabels,
+                                           trackSampleLabels])
+
+    ind = np.cast[int]((samplePoints - minVox)//spacing)
+    ind = ind[np.min(ind, axis = -1) >= 0]
+    ind = ind[np.max(ind, axis = -1) < nVoxX]
+    
+    # get the bin centers that correspond to each track sample
+    binCenters = np.array([trackVoxelEdges[i][ind[:,i]] + 0.5*spacing[i]
+                           for i in range(3)])
+
+    # sum the energy in voxels that are occupied
+    voxelContent = defaultdict(int)
+    voxelPID = defaultdict(list)
+    voxelt0 = defaultdict(list)
+    voxelLabel = defaultdict(list)
+    for coord, w, pid, t0, label in zip(binCenters.T, sampleWeights, samplePIDs, samplet0s, sampleLabels):
+        voxelContent[tuple(coord)] += w
+        voxelPID[tuple(coord)].append(pid)
+        voxelt0[tuple(coord)].append(t0)
+        voxelLabel[tuple(coord)].append(label)
+
+    modalPID = {key: st.mode(value)[0][0] for key, value in voxelPID.items()}
+    mediant0 = {key: np.median(value) for key, value in voxelt0.items()}
+    modalLabel = {key: st.mode(value)[0][0] for key, value in voxelLabel.items()}
+    
+    return (list(voxelContent.keys()), 
+            list(voxelContent.values()), 
+            list(modalPID.values()), 
+            list(mediant0.values()), 
+            list(modalLabel.values()))
+
+
+voxel_dtype = np.dtype([("eventID", "u4"),
+                        ("xBin", "f4"),
+                        ("yBin", "f4"),
+                        ("zBin", "f4"),
+                        ("dE", "f4"),
+                        ("PID", "u4"),
+                        ("t0", "f4"),
+                        ("semantic_label", "u4"),
+                    ],
+                       align = True)
+
+def main(args):
+    infile = h5py.File(args.infile, 'r')
+    outfile = h5py.File(args.output, 'w')    
+    
+    for key in infile.keys():
+        if key != "track_voxels":
+            if type(infile[key]) == h5py.Dataset:
+                outfile.create_dataset(key, data = infile[key])
+            elif type(infile[key]) == h5py.Group:
+                outfile.create_group(key)
+                infile.copy(infile[key], outfile[key], key)
+            
+    outfile.create_dataset("track_voxels",
+                           shape = (0,),
+                           dtype = voxel_dtype,
+                           maxshape = (None,))
+
+    try:
+        tracks = infile['tracks']
+    except KeyError:
+        tracks = infile['segments']
+    trajectories = infile['trajectories']
+
+    for track_ev_id in tqdm.tqdm(np.unique(tracks['eventID'])):
+
+        tracks_ev = tracks[tracks['eventID'] == track_ev_id]
+        traj_ev = trajectories[trajectories['eventID'] == track_ev_id]
+            
+        voxelizedEdep = voxelize(tracks_ev, traj_ev, args.config)
+
+        nVox = len(voxelizedEdep[1])
+        evVoxels = np.empty(nVox, dtype = voxel_dtype)
+        evVoxels['xBin'] = np.array([pos[0] for pos in voxelizedEdep[0]])
+        evVoxels['yBin'] = np.array([pos[1] for pos in voxelizedEdep[0]])
+        evVoxels['zBin'] = np.array([pos[2] for pos in voxelizedEdep[0]])
+        evVoxels['dE'] = voxelizedEdep[1]
+        evVoxels['PID'] = voxelizedEdep[2]
+        evVoxels['t0'] = voxelizedEdep[3]
+        evVoxels['semantic_label'] = voxelizedEdep[4]
+        evVoxels['eventID'] = track_ev_id*np.ones(nVox)
+
+        nVoxPrev = len(outfile['track_voxels'])
+        outfile['track_voxels'].resize((nVox+nVoxPrev,))
+        outfile['track_voxels'][nVoxPrev:] = evVoxels
+        
+if __name__ == '__main__':
+
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('infile', type = str,
+                        help = "input hdf5 larpix file (from dumpTree.py)")
+    parser.add_argument('-c', '--config', type = str,
+                        default = 'ND-LAr',
+                        help = "voxel boundary configuration.  Should be one of: 'ND-LAr', '2x2'")
+    parser.add_argument('-o', '--output', type = str,
+                        required = True,
+                        help = "output hdf5 file containing an additional database of voxelized edeps")
+
+    args = parser.parse_args()
+
+    main(args)
